@@ -11,8 +11,8 @@ import (
 
 // пример вот
 // 001b213c4d5e 0025645d1e22 0800 ethernet
-// и 0800 это IPv4 
-// 4500003c1c46400040 06 00000a000002 5db8d822 
+// и 0800 это IPv4
+// 4500003c1c46400040 06 00000a000002 5db8d822
 // 06 это tcp, 17 это udp
 // a86a0050 12345678 00000000 a002faf0 00000000
 
@@ -36,9 +36,9 @@ func readAllAndClean(r io.Reader) ([]byte, error) {
 }
 
 func isHexChar(b byte) bool {
-    return (b >= '0' && b <= '9') ||
-        (b >= 'a' && b <= 'f') ||
-        (b >= 'A' && b <= 'F')
+	return (b >= '0' && b <= '9') ||
+		(b >= 'a' && b <= 'f') ||
+		(b >= 'A' && b <= 'F')
 }
 
 func Ethernet() {
@@ -128,7 +128,7 @@ func checksumValid(b []byte, headerLen int) bool {
 		if i == 10 {
 			word = 0
 		} else {
-			word = binary.BigEndian.Uint16(b[i:i+2])
+			word = binary.BigEndian.Uint16(b[i : i+2])
 		}
 		sum += uint32(word)
 	}
@@ -200,10 +200,10 @@ func UDP(b []byte, totalLength, ihlBytes int) {
 
 func main() {
 	defer func() {
-        if r := recover(); r != nil {
-            fmt.Fprintln(os.Stderr, "malformed frame")
-            os.Exit(1)
-        }
-    }()
-    Ethernet()
+		if r := recover(); r != nil {
+			fmt.Fprintln(os.Stderr, "malformed frame")
+			os.Exit(1)
+		}
+	}()
+	Ethernet()
 }
