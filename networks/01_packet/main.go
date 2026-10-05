@@ -42,7 +42,11 @@ func isHexChar(b byte) bool {
 }
 
 func Ethernet() {
-	bytes, _ := readAllAndClean(os.Stdin)
+	bytes, err := readAllAndClean(os.Stdin)
+	if err != nil || len(bytes) < 14 {
+		fmt.Fprintln(os.Stderr, "bad input")
+		os.Exit(1)
+	}
 	i := 0
 	macDestination := strings.Builder{}
 	for i < 6 {
@@ -78,6 +82,10 @@ func Ethernet() {
 func IPv4(b []byte) {
 	version := b[0] >> 4
 	ihl := (b[0] & 0x0F) * 4
+	if int(ihl) < 20 || int(ihl) > len(b) {
+		fmt.Fprintln(os.Stderr, "bad ihl")
+		os.Exit(1)
+	}
 	fmt.Printf("ip.version %d\n", version)
 	fmt.Printf("ip.ihl_bytes %d\n", ihl)
 	fmt.Printf("ip.total_length %d\n", binary.BigEndian.Uint16(b[2:4]))
@@ -191,5 +199,11 @@ func UDP(b []byte, totalLength, ihlBytes int) {
 }
 
 func main() {
-	Ethernet()
+	defer func() {
+        if r := recover(); r != nil {
+            fmt.Fprintln(os.Stderr, "malformed frame")
+            os.Exit(1)
+        }
+    }()
+    Ethernet()
 }
