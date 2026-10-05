@@ -1,3 +1,6 @@
 packet
 *.exe
 .DS_Store
+packet
+*.exe
+.DS_Store
