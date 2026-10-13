@@ -12,6 +12,9 @@ import (
 	"time"
 )
 
+const maxRetryAfterSec = 60 // верхний предел, 
+// чтобы не усыпить клиент и не переполнить умножение
+
 func newClient() *http.Client {
 	return &http.Client{
 		Timeout: 5 * time.Second,
@@ -40,7 +43,11 @@ func doAttempt(client *http.Client, method, url, key string) (int, int, error) {
 	}
 
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body) // читаем тело, чтобы соединение закрыть
+	
+	// обрыв соединения или таймаут во время чтения тела — это ошибка попытки
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return 0, -1, err
+	}
 	
 	retryAfter := -1
 	if header := resp.Header.Get("Retry-After"); header != "" {
