@@ -1,38 +1,29 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 )
 
-// пример вот
-// 001b213c4d5e 0025645d1e22 0800 ethernet
-// и 0800 это IPv4
-// 4500003c1c46400040 06 00000a000002 5db8d822
-// 06 это tcp, 17 это udp
-// a86a0050 12345678 00000000 a002faf0 00000000
-
-func readAllAndClean(r io.Reader) ([]byte, error) {
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]byte, 0, len(data))
-	for _, b := range data {
-		if isHexChar(b) {
-			out = append(out, b)
+func parseHexDump(data []byte) ([]byte, error) {
+	clean := make([]byte, 0, len(data))
+	for i, c := range data {
+		switch {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ':':
+			continue
+		case isHexChar(c):
+			clean = append(clean, c)
+		default:
+			return nil, fmt.Errorf("недопустимый символ %q на позиции %d", c, i)
 		}
 	}
-	dst := make([]byte, hex.DecodedLen(len(out)))
-	_, err = hex.Decode(dst, out)
-	if err != nil {
-		return nil, err
-	}
-	return dst, nil
+	return hex.DecodeString(string(clean))
 }
 
 func isHexChar(b byte) bool {
@@ -41,144 +32,134 @@ func isHexChar(b byte) bool {
 		(b >= 'A' && b <= 'F')
 }
 
-func Ethernet() {
-	bytes, err := readAllAndClean(os.Stdin)
-	if err != nil || len(bytes) < 14 {
-		fmt.Fprintln(os.Stderr, "bad input")
-		os.Exit(1)
+// разбирает кадр
+func parseEthernet(frame []byte, w io.Writer) error {
+	if len(frame) < 14 {
+		return fmt.Errorf("кадр короче заголовка Ethernet: %d байт", len(frame))
 	}
-	i := 0
-	macDestination := strings.Builder{}
-	for i < 6 {
-		macDestination.WriteString(fmt.Sprintf("%02x:", bytes[i]))
-		i++
-		macDestination.WriteString(fmt.Sprintf("%02x", bytes[i]))
-		i++
-		if i != 6 {
-			macDestination.WriteString(fmt.Sprint(":"))
-		}
-	}
-	macSource := strings.Builder{}
-	for i < 12 {
-		macSource.WriteString(fmt.Sprintf("%02x:", bytes[i]))
-		i++
-		macSource.WriteString(fmt.Sprintf("%02x", bytes[i]))
-		i++
-		if i != 12 {
-			macSource.WriteString(fmt.Sprint(":"))
-		}
-	}
-	etherType := binary.BigEndian.Uint16(bytes[12:14])
-	fmt.Printf("eth.dst %s\n", macDestination.String())
-	fmt.Printf("eth.src %s\n", macSource.String())
-	fmt.Printf("eth.ethertype 0x%04x\n", etherType)
+	etherType := binary.BigEndian.Uint16(frame[12:14])
+	fmt.Fprintf(w, "eth.dst %s\n", net.HardwareAddr(frame[0:6]))
+	fmt.Fprintf(w, "eth.src %s\n", net.HardwareAddr(frame[6:12]))
+	fmt.Fprintf(w, "eth.ethertype 0x%04x\n", etherType)
 
-	if etherType == 0x0800 { // 0x86dd IPv6 0x0806 ARP
-		IPv4(bytes[14:])
+	if etherType == 0x0800 { // 0x86dd IPv6, 0x0806 ARP
+		return parseIPv4(frame[14:], w)
 	}
-
+	return nil
 }
 
-func IPv4(b []byte) {
-	version := b[0] >> 4
-	ihl := (b[0] & 0x0F) * 4
-	if int(ihl) < 20 || int(ihl) > len(b) {
-		fmt.Fprintln(os.Stderr, "bad ihl")
-		os.Exit(1)
+func parseIPv4(b []byte, w io.Writer) error {
+	if len(b) < 20 {
+		return fmt.Errorf("заголовок IPv4 короче 20 байт: %d", len(b))
 	}
-	fmt.Printf("ip.version %d\n", version)
-	fmt.Printf("ip.ihl_bytes %d\n", ihl)
-	fmt.Printf("ip.total_length %d\n", binary.BigEndian.Uint16(b[2:4]))
-	fmt.Printf("ip.id 0x%04x\n", binary.BigEndian.Uint16(b[4:6]))
-	v := binary.BigEndian.Uint16(b[6:8])
+	version := b[0] >> 4
+	if version != 4 {
+		return fmt.Errorf("ожидалась версия IP 4, в пакете %d", version)
+	}
+	ihl := int(b[0]&0x0F) * 4
+	if ihl < 20 || ihl > len(b) {
+		return fmt.Errorf("некорректный ihl: %d", ihl)
+	}
+	totalLength := int(binary.BigEndian.Uint16(b[2:4]))
+	if totalLength < ihl {
+		return fmt.Errorf("total_length %d меньше ihl %d", totalLength, ihl)
+	}
+	payloadLen := totalLength - ihl // длина всего, что идёт после IP-заголовка
+
+	fl := binary.BigEndian.Uint16(b[6:8])
+	proto := b[9]
+
+	var transport func() error
+	if fl&0x1FFF == 0 {
+		switch proto {
+		case 6:
+			transport = func() error { return parseTCP(b[ihl:], payloadLen, w) }
+		case 17:
+			transport = func() error { return parseUDP(b[ihl:], payloadLen, w) }
+		}
+	}
 	var flags string
 	switch {
-	case v&0x4000 != 0 && v&0x2000 != 0:
+	case fl&0x4000 != 0 && fl&0x2000 != 0:
 		flags = "DF,MF"
-	case v&0x4000 != 0:
+	case fl&0x4000 != 0:
 		flags = "DF"
-	case v&0x2000 != 0:
+	case fl&0x2000 != 0:
 		flags = "MF"
 	default:
 		flags = "none"
 	}
-	fmt.Printf("ip.flags %s\n", flags)
-	fmt.Printf("ip.frag_offset %d\n", int(v&0x1FFF)*8)
 
-	fmt.Printf("ip.ttl %d\n", b[8])
-	fmt.Printf("ip.protocol %d\n", b[9])
-	fmt.Printf("ip.src %d.%d.%d.%d\n", b[12], b[13], b[14], b[15])
-	fmt.Printf("ip.dst %d.%d.%d.%d\n", b[16], b[17], b[18], b[19])
-	fmt.Printf("ip.checksum_valid %t\n", checksumValid(b, int(ihl)))
-	totalLength := int(binary.BigEndian.Uint16(b[2:4]))
-	switch b[9] {
-	case 6:
-		TCP(b[ihl:], totalLength, int(ihl))
-	case 17:
-		UDP(b[ihl:], totalLength, int(ihl))
-	default:
-		fmt.Printf("payload.length %d\n", totalLength-int(ihl))
+	fmt.Fprintf(w, "ip.version %d\n", version)
+	fmt.Fprintf(w, "ip.ihl_bytes %d\n", ihl)
+	fmt.Fprintf(w, "ip.total_length %d\n", totalLength)
+	fmt.Fprintf(w, "ip.id 0x%04x\n", binary.BigEndian.Uint16(b[4:6]))
+	fmt.Fprintf(w, "ip.flags %s\n", flags)
+	fmt.Fprintf(w, "ip.frag_offset %d\n", int(fl&0x1FFF)*8)
+	fmt.Fprintf(w, "ip.ttl %d\n", b[8])
+	fmt.Fprintf(w, "ip.protocol %d\n", proto)
+	fmt.Fprintf(w, "ip.src %d.%d.%d.%d\n", b[12], b[13], b[14], b[15])
+	fmt.Fprintf(w, "ip.dst %d.%d.%d.%d\n", b[16], b[17], b[18], b[19])
+	fmt.Fprintf(w, "ip.checksum_valid %t\n", checksumValid(b, ihl))
+
+	if transport != nil {
+		return transport()
 	}
+	fmt.Fprintf(w, "payload.length %d\n", payloadLen)
+	return nil
 }
 
 func checksumValid(b []byte, headerLen int) bool {
 	var sum uint32
 	for i := 0; i < headerLen; i += 2 {
-		var word uint16
-		if i == 10 {
-			word = 0
-		} else {
-			word = binary.BigEndian.Uint16(b[i : i+2])
+		if i == 10 { // само поле checksum считаем нулём
+			continue
 		}
-		sum += uint32(word)
+		sum += uint32(binary.BigEndian.Uint16(b[i : i+2]))
 	}
 	for sum>>16 != 0 {
 		sum = (sum & 0xFFFF) + (sum >> 16)
 	}
-	got := ^uint16(sum)
-	want := binary.BigEndian.Uint16(b[10:12])
-	return got == want
+	return ^uint16(sum) == binary.BigEndian.Uint16(b[10:12])
 }
 
-func TCP(b []byte, totalLength, ihlBytes int) {
-	srcPort := binary.BigEndian.Uint16(b[0:2])
-	dstPort := binary.BigEndian.Uint16(b[2:4])
-	seq := binary.BigEndian.Uint32(b[4:8])
-	ack := binary.BigEndian.Uint32(b[8:12])
-	dataOffset := int(b[12]>>4) * 4
-	flagsByte := b[13]
-	window := binary.BigEndian.Uint16(b[14:16])
+// seg это всё после IP-заголовка, ipPayload это total_length - ihl.
+func parseTCP(seg []byte, ipPayload int, w io.Writer) error {
+	if len(seg) < 20 {
+		return fmt.Errorf("сегмент TCP короче 20 байт: %d", len(seg))
+	}
+	dataOffset := int(seg[12]>>4) * 4
+	if dataOffset < 20 || dataOffset > len(seg) {
+		return fmt.Errorf("некорректный tcp data offset: %d байт", dataOffset)
+	}
+	if ipPayload < dataOffset {
+		return fmt.Errorf("total_length не вмещает заголовок TCP (%d < %d)", ipPayload, dataOffset)
+	}
 
-	fmt.Printf("tcp.src_port %d\n", srcPort)
-	fmt.Printf("tcp.dst_port %d\n", dstPort)
-	fmt.Printf("tcp.seq %d\n", seq)
-	fmt.Printf("tcp.ack %d\n", ack)
-	fmt.Printf("tcp.data_offset_bytes %d\n", dataOffset)
-	fmt.Printf("tcp.flags %s\n", tcpFlags(flagsByte))
-	fmt.Printf("tcp.window %d\n", window)
-
-	fmt.Printf("payload.length %d\n", totalLength-ihlBytes-dataOffset)
+	fmt.Fprintf(w, "tcp.src_port %d\n", binary.BigEndian.Uint16(seg[0:2]))
+	fmt.Fprintf(w, "tcp.dst_port %d\n", binary.BigEndian.Uint16(seg[2:4]))
+	fmt.Fprintf(w, "tcp.seq %d\n", binary.BigEndian.Uint32(seg[4:8]))
+	fmt.Fprintf(w, "tcp.ack %d\n", binary.BigEndian.Uint32(seg[8:12]))
+	fmt.Fprintf(w, "tcp.data_offset_bytes %d\n", dataOffset)
+	fmt.Fprintf(w, "tcp.flags %s\n", tcpFlags(seg[13]))
+	fmt.Fprintf(w, "tcp.window %d\n", binary.BigEndian.Uint16(seg[14:16]))
+	fmt.Fprintf(w, "payload.length %d\n", ipPayload-dataOffset)
+	return nil
 }
 
 func tcpFlags(b byte) string {
+	names := []struct {
+		mask byte
+		name string
+	}{
+		{0x01, "FIN"}, {0x02, "SYN"}, {0x04, "RST"},
+		{0x08, "PSH"}, {0x10, "ACK"}, {0x20, "URG"},
+	}
 	var parts []string
-	if b&0x01 != 0 {
-		parts = append(parts, "FIN")
-	}
-	if b&0x02 != 0 {
-		parts = append(parts, "SYN")
-	}
-	if b&0x04 != 0 {
-		parts = append(parts, "RST")
-	}
-	if b&0x08 != 0 {
-		parts = append(parts, "PSH")
-	}
-	if b&0x10 != 0 {
-		parts = append(parts, "ACK")
-	}
-	if b&0x20 != 0 {
-		parts = append(parts, "URG")
+	for _, f := range names {
+		if b&f.mask != 0 {
+			parts = append(parts, f.name)
+		}
 	}
 	if len(parts) == 0 {
 		return "none"
@@ -186,24 +167,39 @@ func tcpFlags(b byte) string {
 	return strings.Join(parts, ",")
 }
 
-func UDP(b []byte, totalLength, ihlBytes int) {
-	srcPort := binary.BigEndian.Uint16(b[0:2])
-	dstPort := binary.BigEndian.Uint16(b[2:4])
-	length := binary.BigEndian.Uint16(b[4:6])
+func parseUDP(seg []byte, ipPayload int, w io.Writer) error {
+	const udpHeaderLen = 8
+	if len(seg) < udpHeaderLen {
+		return fmt.Errorf("датаграмма UDP короче 8 байт: %d", len(seg))
+	}
+	if ipPayload < udpHeaderLen {
+		return fmt.Errorf("total_length не вмещает заголовок UDP (%d < 8)", ipPayload)
+	}
 
-	fmt.Printf("udp.src_port %d\n", srcPort)
-	fmt.Printf("udp.dst_port %d\n", dstPort)
-	fmt.Printf("udp.length %d\n", length)
-
-	fmt.Printf("payload.length %d\n", totalLength-ihlBytes-8)
+	fmt.Fprintf(w, "udp.src_port %d\n", binary.BigEndian.Uint16(seg[0:2]))
+	fmt.Fprintf(w, "udp.dst_port %d\n", binary.BigEndian.Uint16(seg[2:4]))
+	fmt.Fprintf(w, "udp.length %d\n", binary.BigEndian.Uint16(seg[4:6]))
+	fmt.Fprintf(w, "payload.length %d\n", ipPayload-udpHeaderLen)
+	return nil
 }
 
 func main() {
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Fprintln(os.Stderr, "malformed frame")
-			os.Exit(1)
-		}
-	}()
-	Ethernet()
+	input, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ошибка чтения stdin:", err)
+		os.Exit(1)
+	}
+	frame, err := parseHexDump(input)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bad input:", err)
+		os.Exit(1)
+	}
+
+	// печатаем только после полного разбора
+	var out bytes.Buffer
+	if err := parseEthernet(frame, &out); err != nil {
+		fmt.Fprintln(os.Stderr, "malformed frame:", err)
+		os.Exit(1)
+	}
+	os.Stdout.Write(out.Bytes())
 }
