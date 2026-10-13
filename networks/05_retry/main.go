@@ -4,12 +4,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
-	"time"
 	"strings"
-	"math/rand"
+	"time"
 )
 
 func newClient() *http.Client {
@@ -38,12 +38,13 @@ func doAttempt(client *http.Client, method, url, key string) (int, int, error) {
 	if err != nil {
 		return 0, -1, err
 	}
+
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body) // читаем тело, чтобы соединение закрыть
+	_, _ = io.Copy(io.Discard, resp.Body) // читаем тело, чтобы соединение закрыть
+	
 	retryAfter := -1
-	header := resp.Header.Get("Retry-After")
-	if header != "" {
-		if v, err := strconv.Atoi(header); err == nil {
+	if header := resp.Header.Get("Retry-After"); header != "" {
+		if v, err := strconv.Atoi(header); err == nil && v >= 0 {
 			retryAfter = v
 		}
 	}
@@ -86,42 +87,36 @@ func main() {
 		os.Exit(1)
 	}
 	url := os.Args[1]
+
 	fs := flag.NewFlagSet("retry", flag.ExitOnError)
-	method := fs.String("method", "GET", "HTTP method")
+	methodFlag := fs.String("method", "GET", "HTTP method")
 	maxAttempts := fs.Int("max-attempts", 5, "max attempts")
 	key := fs.String("idempotency-key", "", "idempotency key")
-	fs.Parse(os.Args[2:])
-	_ = maxAttempts
+	_ = fs.Parse(os.Args[2:]) // при ошибке сам завершит процесс
 	
+	method := strings.ToUpper(*methodFlag)
 	client := newClient()
+	methodRetryable := canRetryMethod(method, *key)
 	attempts := 0
 	success := false
 
 	for n := 1; n <= *maxAttempts; n++ {
 		attempts = n
-		success = false
+		status, retryAfter, err := doAttempt(client, method, url, *key)
 
-		status, retryAfter, err := doAttempt(client, *method, url, *key)
-
-		retry := false
+		shouldRetry := false
 		if err != nil {
 			fmt.Printf("attempt %d error %v\n", n, err)
-			retry = true // нет ответа: это основание для повтора
+			shouldRetry = true // нет ответа: это основание для повтора
 		} else {
 			fmt.Printf("attempt %d status %d\n", n, status)
 			success = status >= 200 && status < 400
-			retry = retryableStatus(status)
+			shouldRetry = retryableStatus(status)
 		}
-		if !retry {
+		if !shouldRetry || !methodRetryable || n == *maxAttempts {
 			break
 		}
-		if !canRetryMethod(*method, *key) {
-			break
-		}
-		if n == *maxAttempts {
-			break
-		}
-		sleep := backoffMs(n + 1)
+		sleep := backoffMs(n)
 		if err == nil && retryAfter >= 0 {
 			sleep = retryAfter * 1000
 		}
