@@ -8,88 +8,89 @@ import (
 	"strings"
 )
 
+func usage() {
+	prog := os.Args[0]
+	fmt.Fprintf(os.Stderr, "Usage:\n  %s subnet <CIDR>\n  %s route <file> <destination IP>\n", prog, prog)
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "Usage: subnet <CIDR>")
+		usage()
 		os.Exit(1)
 	}
 	switch os.Args[1] {
 	case "subnet":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "Usage: subnet <CIDR>")
+			usage()
 			os.Exit(1)
 		}
-		subnet(os.Args[2])
+		if err := subnet(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	case "route":
 		if len(os.Args) < 4 {
-			fmt.Fprintln(os.Stderr, "Usage: route <file> <destination IP>")
+			usage()
 			os.Exit(1)
 		}
-		route(os.Args[2], os.Args[3])
+		os.Exit(route(os.Args[2], os.Args[3]))
 	default:
 		fmt.Fprintln(os.Stderr, "Unknown command:", os.Args[1])
+		usage()
 		os.Exit(1)
 	}
 }
 
-func parseIP(s string) (uint32, bool) {
+func parseIP(s string) (uint32, error) {
 	parts := strings.Split(s, ".")
 	if len(parts) != 4 {
-		fmt.Fprintln(os.Stderr, "Invalid IP address format")
-		return 0, false
+		return 0, fmt.Errorf("invalid ip %q", s)
 	}
 	var ip uint32
 	for _, part := range parts {
 		num, err := strconv.ParseUint(part, 10, 8)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "Invalid IP address format")
-			return 0, false
+			return 0, fmt.Errorf("invalid ip %q", s)
 		}
 		ip = (ip << 8) | uint32(num)
 	}
-	return ip, true
+	return ip, nil
 }
 
 func ipString(ip uint32) string {
-	first := (ip >> 24) & 0xFF
-	second := (ip >> 16) & 0xFF
-	third := (ip >> 8) & 0xFF
-	fourth := ip & 0xFF
-	return fmt.Sprintf("%d.%d.%d.%d", first, second, third, fourth)
+	return fmt.Sprintf("%d.%d.%d.%d", ip>>24, (ip>>16)&0xFF, (ip>>8)&0xFF, ip&0xFF)
 }
 
-func parseCIDR(s string) (ip uint32, prefix int, ok bool) {
-	parts := strings.Split(s, "/")
-	if len(parts) != 2 {
-		fmt.Fprintln(os.Stderr, "Invalid CIDR format")
-		return 0, 0, false
+func parseCIDR(s string) (uint32, int, error) {
+	addr, prefixStr, found := strings.Cut(s, "/")
+	if !found {
+		return 0, 0, fmt.Errorf("invalid cidr %q: no prefix", s)
 	}
-	ip, ok = parseIP(parts[0])
-	if !ok {
-		fmt.Fprintln(os.Stderr, "Invalid IP address in CIDR")
-		return 0, 0, false
+	ip, err := parseIP(addr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid cidr %q: %w", s, err)
 	}
-	val, err := strconv.ParseUint(parts[1], 10, 8)
-	if err != nil || val < 0 || val > 32 {
-		fmt.Fprintln(os.Stderr, "Invalid prefix in CIDR")
-		return 0, 0, false
+	val, err := strconv.ParseUint(prefixStr, 10, 8)
+	if err != nil || val > 32 {
+		return 0, 0, fmt.Errorf("invalid cidr %q: bad prefix", s)
 	}
-	return ip, int(val), true
+	return ip, int(val), nil
 }
 
 func mask(n int) uint32 {
 	return uint32(0xFFFFFFFF) << (32 - n)
 }
 
-func subnet(s string) {
-	ip, prefix, ok := parseCIDR(s)
-	if !ok {
-		os.Exit(1)
+func subnet(s string) error {
+	ip, prefix, err := parseCIDR(s)
+	if err != nil {
+		return err
 	}
 	netmask := mask(prefix)
 	network := ip & netmask
 	broadcast := network | ^netmask
 	size := uint64(1) << (32 - prefix)
+
 	var first, last uint32
 	var hosts uint64
 	bcast := ipString(broadcast)
@@ -116,12 +117,14 @@ func subnet(s string) {
 	fmt.Printf("first %s\n", ipString(first))
 	fmt.Printf("last %s\n", ipString(last))
 	fmt.Printf("hosts %d\n", hosts)
+	return nil
 }
 
-func route(file, dstArg string) {
-	ip, ok := parseIP(dstArg)
-	if !ok {
-		os.Exit(1)
+func route(file, dstArg string) int {
+	ip, err := parseIP(dstArg)
+	if err != nil{
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
 	}
 	f, err := os.Open(file)
 	if err != nil {
@@ -134,20 +137,19 @@ func route(file, dstArg string) {
 	bestIface := ""
 
 	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
+	for lineNo := 1; scanner.Scan(); lineNo++ {
 		s := strings.TrimSpace(scanner.Text())
 		if s == "" || strings.HasPrefix(s, "#") {
 			continue
 		}
 		parts := strings.Fields(s)
 		if len(parts) < 2 {
-			fmt.Fprintln(os.Stderr, "Invalid route entry:", s)
+			fmt.Fprintf(os.Stderr, "line %d: invalid route entry %q\n", lineNo, s)
 			continue
 		}
-		cidr := parts[0]
-		network, prefix, ok := parseCIDR(cidr)
-		if !ok {
-			fmt.Fprintln(os.Stderr, "Invalid CIDR in route entry:", cidr)
+		network, prefix, err := parseCIDR(parts[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "line %d: %v\n", lineNo, err)
 			continue
 		}
 		m := mask(prefix)
@@ -156,11 +158,15 @@ func route(file, dstArg string) {
 			bestIface = parts[1]
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "error reading file:", err)
+		return 1
+	}
 	if bestPrefix == -1 {
 		fmt.Println("unreachable true")
-		os.Exit(1)
-	} else {
-		fmt.Printf("via %s\n", bestIface)
-		fmt.Printf("prefix %d\n", bestPrefix)
+		return 1
 	}
+	fmt.Printf("via %s\n", bestIface)
+	fmt.Printf("prefix %d\n", bestPrefix)
+	return 0
 }
